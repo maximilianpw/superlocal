@@ -236,7 +236,7 @@ Real connections default to normal mail access (`allowProviderWrites.real: true`
 
 The host fixes IMAP to `imap.fastmail.com:993` and SMTP to `smtp.fastmail.com:465`, both with TLS. Superlocal saves a Sent copy via IMAP; if enabled, turn off Fastmail's **Save a copy when sending through third-party email clients** option under the advanced composing preferences in **Settings → My email addresses** to avoid duplicates. To replace an app password, choose **Reconnect** and select **Fastmail** again, using the same login.
 
-The built-in preset IDs `icloud` and `fastmail` are reserved. If an older installation has a custom preset named `fastmail`, do not silently rename an existing connected account's preset: retain its original configuration/build until that connection's migration has been planned.
+The new built-in uses `builtin:fastmail`, outside the allowed custom-preset ID syntax. Existing custom presets named `fastmail` retain their endpoints, usernames, Sent policy and connection identity; no renaming or migration is needed. Reconnect requires selecting the original mail service. After a failed attempt, **Try again** retains the connection and service selection but clears the password.
 
 <details>
 <summary>Runtime storage and advanced local configuration</summary>

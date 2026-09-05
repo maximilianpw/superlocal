@@ -16,6 +16,7 @@ import { CredentialError, InboxError } from '../src/contracts'
 import { createGoogleOAuthHost, type GoogleOAuthConfig, type OAuthAttempt } from '../server/google-oauth'
 import { createGoogleOAuthApi } from '../server/google-oauth-api'
 import { createGoogleOAuthClient } from '../server/google-client'
+import { ImapProvider, type ImapCredentials } from '../server/sdk/imap'
 import { createLocalHost } from '../../../apps/local-host/src/host'
 import { loadLocalConfig, type LocalConfig } from '../../../apps/local-host/src/config'
 import { createAttentionFeedbackStore } from '../../../apps/local-host/src/attention-feedback'
@@ -40,7 +41,7 @@ import type {
   ThreadSummary, MediaNetwork,
 } from '../src/contracts'
 import {
-  ProviderAuthenticationError, ProviderCursorExpiredError, ProviderError,
+  createMailAccount, ProviderAuthenticationError, ProviderCursorExpiredError, ProviderError,
   ProviderNotFoundError, ProviderRateLimitError, ProviderMutationError, UnsupportedOperationError,
 } from '../server/sdk/types'
 import type { ConnectionSources } from '../server/sdk/mail-sources'
@@ -1241,7 +1242,7 @@ describe('IMAP host onboarding boundary', () => {
     const descriptor = await (await host.fetch(new Request(`${base}/host/config`, { headers }))).json()
     expect(descriptor.providers).toEqual([expect.objectContaining({ id: 'imap', ready: true, mailboxSelection: 'automatic', reconnect: true,
       fields: [expect.objectContaining({ name: 'preset', defaultValue: 'icloud', options: [
-        { value: 'icloud', label: 'iCloud Mail' }, { value: 'fastmail', label: 'Fastmail' },
+        { value: 'icloud', label: 'iCloud Mail' }, { value: 'builtin:fastmail', label: 'Fastmail' },
       ] }), expect.objectContaining({ name: 'email', type: 'email' }), expect.objectContaining({ name: 'password', label: 'App-specific password', type: 'password' }),
       expect.objectContaining({ name: 'imapUsername', advanced: true }), expect.objectContaining({ name: 'smtpUsername', advanced: true })] })])
     expect(await host.inbox.accounts(host.owner)).toEqual([])
@@ -1258,18 +1259,18 @@ describe('IMAP host onboarding boundary', () => {
       expect(captured.identity.subject).toBe('reader@icloud.com')
       expect(await connected.json()).toEqual({ connectionId: 'synthetic-connection' })
       const fastmail = await host.fetch(new Request(path, { method: 'POST', headers, body: JSON.stringify({ credentials: {
-        preset: 'fastmail', email: 'Reader@Example.com', password, imapUsername: 'ignored@example.com', smtpUsername: 'ignored@example.com',
+        preset: 'builtin:fastmail', email: 'Reader@Example.com', password, imapUsername: 'ignored@example.com', smtpUsername: 'ignored@example.com',
       } }) }))
       expect(fastmail.status).toBe(200)
       expect(captured.input.credentials.password).toBe(password)
       expect(captured.input.providerId).toBe('imap')
-      const fastmailPreset = { id: 'fastmail', name: 'Fastmail', imap: { host: 'imap.fastmail.com', port: 993, secure: true },
+      const fastmailPreset = { id: 'builtin:fastmail', name: 'Fastmail', imap: { host: 'imap.fastmail.com', port: 993, secure: true },
         smtp: { host: 'smtp.fastmail.com', port: 465, secure: true }, sentCopy: 'append' }
       expect(captured.identity).toEqual({ issuer: 'imaps://imap.fastmail.com:993', subject: 'reader@example.com',
         registrationId: createHash('sha256').update(JSON.stringify([fastmailPreset, 'reader@example.com', 'reader@example.com'])).digest('hex') })
       for (const [code, expected] of [['AUTHENTICATION', 'app-specific password'], ['CONNECTION_EXISTS', 'already connected']]) {
         host.inbox.createConnection = async () => { throw new InboxError(code!, 'Synthetic failure', 409) }
-        const failed = await host.fetch(new Request(path, { method: 'POST', headers, body: JSON.stringify({ credentials: { preset: 'fastmail', email: 'reader@example.com', password } }) }))
+        const failed = await host.fetch(new Request(path, { method: 'POST', headers, body: JSON.stringify({ credentials: { preset: 'builtin:fastmail', email: 'reader@example.com', password } }) }))
         expect(failed.status).toBe(409)
         const body = await failed.text()
         expect(body).toContain(expected!)
@@ -1295,18 +1296,67 @@ describe('IMAP host onboarding boundary', () => {
     } finally { host.inbox.createConnection = original }
   })
 
-  test('built-in Fastmail preset cannot be shadowed; custom presets remain available', async () => {
+  test('legacy fastmail presets preserve endpoints, identities and credential replacement across host reload', async () => {
     const root = await mkdtemp(join(TEMP_ROOT, 'fastmail-config-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
     const configPath = join(root, 'local.json')
     loadLocalConfig({ configPath, environment: {} })
     const input = JSON.parse(await readFile(configPath, 'utf8'))
-    input.providers.imap.servers = [{ id: 'fastmail', name: 'Custom server', imap: { host: 'imap.example.com', port: 993, secure: true }, sentCopy: 'append' }]
+    const legacy = { id: 'fastmail', name: 'Legacy mail', imap: { host: 'imap.example.com', port: 993, secure: true },
+      smtp: { host: 'smtp.example.com', port: 587, secure: false }, sentCopy: 'server' } as const
+    input.mode = 'real'
+    input.dataDir = join(root, 'runtime')
+    input.providers.imap.servers = [legacy]
     await writeFile(configPath, JSON.stringify(input))
-    expect(() => loadLocalConfig({ configPath, environment: {} })).toThrow('IMAP preset id')
-    input.providers.imap.servers[0].id = 'custom-mail'
-    await writeFile(configPath, JSON.stringify(input))
-    expect(loadLocalConfig({ configPath, environment: {} }).providers.imap.servers[0]?.id).toBe('custom-mail')
+    const config = loadLocalConfig({ configPath, environment: {} })
+    expect(config.providers.imap.servers).toEqual([legacy])
+    const credentials = { preset: 'fastmail', email: 'reader@example.com', password: 'fictional-original',
+      imapUsername: 'legacy-imap', smtpUsername: 'legacy-smtp' }
+    const identity = { issuer: 'imaps://imap.example.com:993', subject: 'legacy-imap',
+      registrationId: createHash('sha256').update(JSON.stringify([legacy, credentials.email, credentials.smtpUsername])).digest('hex') }
+    let prepared: ImapCredentials | undefined
+    const getAccount = spyOn(ImapProvider.prototype, 'getAccount').mockImplementation(async function (this: ImapProvider) {
+      prepared = (this as unknown as { credentials: ImapCredentials }).credentials
+      if (prepared.imap?.password === 'fictional-revoked') throw new ProviderAuthenticationError('imap')
+      return createMailAccount('imap', prepared, { email: prepared.email! })
+    })
+    const listFolders = spyOn(ImapProvider.prototype, 'listFolders').mockResolvedValue([])
+    let host: Awaited<ReturnType<typeof createLocalHost>> | undefined
+    try {
+      host = await createLocalHost(config, {})
+      // Persist the identity used by the pre-Fastmail host; provider reconstruction must not redirect it.
+      const connection = await host.inbox.createConnection(host.owner, { providerId: 'imap', credentials }, identity)
+      const boxes = await host.inbox.mailboxes(host.owner)
+      expect(boxes).toHaveLength(1)
+      expect(prepared).toMatchObject({ imap: { ...legacy.imap, user: 'legacy-imap' }, smtp: { ...legacy.smtp, user: 'legacy-smtp' }, sentCopy: 'server' })
+      await host.close()
+      host = await createLocalHost(loadLocalConfig({ configPath, environment: {} }), {})
+      expect((await host.inbox.connection(host.owner, connection.id)).identity).toEqual(identity)
+      const base = `http://localhost:${config.backend.port}`
+      const session = await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: config.web.origin, 'X-Superlocal': '1' } }))
+      const headers = { Origin: config.web.origin, Cookie: session.headers.get('set-cookie')!.split(';')[0]!, 'Content-Type': 'application/json' }
+      const descriptor = await (await host.fetch(new Request(`${base}/host/config`, { headers }))).json()
+      expect(descriptor.providers[0].fields[0].options).toContainEqual({ value: 'fastmail', label: 'Legacy mail' })
+      expect(descriptor.providers[0].fields[0].options).toContainEqual({ value: 'builtin:fastmail', label: 'Fastmail' })
+      const version = (await host.inbox.credentialState(host.owner, connection.id)).version
+      for (const [preset, password, expected] of [
+        ['builtin:fastmail', 'fictional-replacement', 409],
+        ['fastmail', 'fictional-revoked', 409],
+        ['fastmail', 'fictional-replacement', 200],
+      ] as const) {
+        const result = await host.fetch(new Request(`${base}/host/providers/imap/connections/${connection.id}/reconnect`, {
+          method: 'POST', headers, body: JSON.stringify({ credentials: { ...credentials, preset, password } }),
+        }))
+        expect(result.status).toBe(expected)
+        expect((await host.inbox.credentialState(host.owner, connection.id)).version).toBe(version + (expected === 200 ? 1 : 0))
+        if (expected === 200) expect(await result.json()).toEqual({ connectionId: connection.id })
+      }
+      expect(prepared).toMatchObject({ imap: { ...legacy.imap, user: 'legacy-imap', password: 'fictional-replacement' },
+        smtp: { ...legacy.smtp, user: 'legacy-smtp' }, sentCopy: 'server' })
+      expect((await host.inbox.connection(host.owner, connection.id)).identity).toEqual(identity)
+      expect((await host.inbox.accounts(host.owner)).map(account => account.id)).toEqual(connection.sourceIds)
+      expect(await host.inbox.mailboxes(host.owner)).toEqual(boxes)
+    } finally { await host?.close(); getAccount.mockRestore(); listFolders.mockRestore() }
   })
 })
 

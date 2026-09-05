@@ -6,7 +6,7 @@ import { connectHostProvider } from "./host";
 import type { InboxStore } from "./inbox";
 
 type Phase = "connecting" | "finding" | "adding" | "syncing" | "refreshing" | "connected" | "failed";
-type Progress = { kind: "progress"; providerId: string; phase: Phase; failedAt: Phase | null; connectionIds: string[]; added: string[]; error: string | null; note: string | null };
+type Progress = { kind: "progress"; providerId: string; reconnectId: string | null; phase: Phase; failedAt: Phase | null; connectionIds: string[]; added: string[]; error: string | null; note: string | null };
 type Step = { kind: "pick" } | { kind: "connect"; providerId: string; reconnectId: string | null } | Progress;
 type Field = NonNullable<HostProvider["fields"]>[number];
 
@@ -134,11 +134,11 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
     report({ phase: "connected", note });
   }
 
-  function begin(providerId: string, connectionIds: string[] = []): AbortController | null {
+  function begin(providerId: string, connectionIds: string[] = [], reconnectId: string | null = null): AbortController | null {
     if (controller.current) return null;
     const operation = new AbortController();
     controller.current = operation;
-    setStep({ kind: "progress", providerId, phase: "connecting", failedAt: null, connectionIds, added: [], error: null, note: null });
+    setStep({ kind: "progress", providerId, reconnectId, phase: "connecting", failedAt: null, connectionIds, added: [], error: null, note: null });
     return operation;
   }
 
@@ -167,7 +167,7 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
     // Credentials exist only in this submission. Clear password controls immediately;
     // never put mail passwords in React state, draft recovery, storage, or URLs.
     for (const input of form.querySelectorAll<HTMLInputElement>('input[type="password"]')) input.value = "";
-    const operation = begin(target.id);
+    const operation = begin(target.id, [], reconnectId);
     if (!operation) return;
     await run(target, operation, async signal => {
       try {
@@ -251,7 +251,7 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
                 </span>
                 {writable && incomplete && <button type="button" className="settings-text-button" onClick={() => setUp(owner, [connectionId])}>Finish setup</button>}
                 {writable && owner.reconnect && <button type="button" className="settings-text-button" onClick={() => {
-                  setPreset(owner.fields?.find(field => field.type === "select")?.defaultValue ?? "");
+                  setPreset("");
                   setStep({ kind: "connect", providerId: owner.id, reconnectId: connectionId });
                 }}>Reconnect</button>}
                 {writable && owner.connection === "oauth" && attention && <button type="button" className="settings-text-button" onClick={() => setStep({ kind: "connect", providerId: owner.id, reconnectId: null })}>Sign in again</button>}
@@ -268,12 +268,13 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
   if (step.kind === "connect") {
     const reconnecting = snapshot.sources.find(source => source.connectionId === step.reconnectId);
     const hasPreset = provider.fields?.some(field => field.type === "select") ?? false;
-    const currentPreset = preset || provider.fields?.find(field => field.type === "select")?.defaultValue || "icloud";
+    const currentPreset = preset || (step.reconnectId ? "" : provider.fields?.find(field => field.type === "select")?.defaultValue || "icloud");
     const isIcloud = !hasPreset || currentPreset === "icloud";
-    const isFastmail = provider.id === "imap" && currentPreset === "fastmail";
+    const isFastmail = provider.id === "imap" && currentPreset === "builtin:fastmail";
     const fieldInput = (field: Field) => <label className="settings-field" key={field.name}>
       <span>{isFastmail && field.name === "email" ? "Fastmail login email" : field.type === "password" && provider.id === "imap" && !isIcloud && !isFastmail ? "Mail password" : field.label}</span>
-      {field.type === "select" ? <select name={field.name} required={field.required} value={currentPreset} onChange={event => setPreset(event.target.value)}>
+      {field.type === "select" ? <select name={field.name} required={field.required || !!step.reconnectId} value={currentPreset} onChange={event => setPreset(event.target.value)}>
+        {step.reconnectId && <option value="" disabled>Select the connected mail service</option>}
         {field.options?.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
       </select> : <input name={field.name} type={field.type} required={field.required} maxLength={4096}
         defaultValue={field.name === "email" ? reconnecting?.email : field.defaultValue} readOnly={field.name === "email" && !!reconnecting}
@@ -287,7 +288,7 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
         </> : <>
           {reconnecting && <p className="settings-note">Enter a new password for {reconnecting.email || reconnecting.name}. Server settings stay the same.</p>}
           {(provider.fields ?? []).filter(field => !field.advanced).map(fieldInput)}
-          {!isIcloud && !isFastmail && provider.fields?.some(field => field.advanced) && <details className="provider-advanced">
+          {currentPreset && !isIcloud && !isFastmail && provider.fields?.some(field => field.advanced) && <details className="provider-advanced">
             <summary>Advanced server settings</summary>
             <p className="settings-note">Server endpoints and required TLS are set by the selected host preset. Change presets in the local host configuration.</p>
             {provider.fields.filter(field => field.advanced).map(fieldInput)}
@@ -336,7 +337,7 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
       {step.phase === "failed" && <div className="mailbox-bulk-actions">
         {failedAfterConnect
           ? <button type="button" className="settings-text-button" onClick={() => setUp(provider, step.connectionIds)}>Retry setup</button>
-          : <button type="button" className="settings-text-button" onClick={() => setStep({ kind: "connect", providerId: provider.id, reconnectId: null })}>Try again</button>}
+          : <button type="button" className="settings-text-button" onClick={() => setStep({ kind: "connect", providerId: provider.id, reconnectId: step.reconnectId })}>Try again</button>}
         <button type="button" className="settings-text-button" onClick={() => setStep({ kind: "pick" })}>Choose another provider</button>
       </div>}
     </div>

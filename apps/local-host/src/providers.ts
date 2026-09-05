@@ -109,7 +109,7 @@ export function createRealRegistrations(config: LocalConfig, runtime: ReturnType
     const presets: ImapHostPreset[] = [{ id: 'icloud', name: 'iCloud Mail',
       imap: { host: 'imap.mail.me.com', port: 993, secure: true },
       smtp: { host: 'smtp.mail.me.com', port: 587, secure: false }, sentCopy: 'append' },
-      { id: 'fastmail', name: 'Fastmail', imap: { host: 'imap.fastmail.com', port: 993, secure: true },
+      { id: 'builtin:fastmail', name: 'Fastmail', imap: { host: 'imap.fastmail.com', port: 993, secure: true },
         smtp: { host: 'smtp.fastmail.com', port: 465, secure: true }, sentCopy: 'append' }, ...config.providers.imap.servers]
     const prepare = (credentials: Record<string, unknown>) => {
       const preset = presets.find(preset => preset.id === (credentials.preset || 'icloud'))
@@ -121,7 +121,7 @@ export function createRealRegistrations(config: LocalConfig, runtime: ReturnType
       // Endpoints, TLS, and Sent policy are host-owned. Browser fields cannot override them.
       // The full iCloud address is Apple's documented alternative IMAP username and required SMTP username.
       const address = email.toLowerCase()
-      const builtInLogin = preset.id === 'icloud' || preset.id === 'fastmail'
+      const builtInLogin = preset.id === 'icloud' || preset.id === 'builtin:fastmail'
       const imapUser = builtInLogin ? address : typeof credentials.imapUsername === 'string' && credentials.imapUsername || address
       const smtpUser = builtInLogin ? address : typeof credentials.smtpUsername === 'string' && credentials.smtpUsername || address
       const identity = { issuer: `imaps://${preset.imap.host}:${preset.imap.port}`, subject: imapUser,
