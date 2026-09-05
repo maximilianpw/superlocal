@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# No external database or authentication needs reconnecting. Dependencies belong
+# in setup, not on the wake path; start the app explicitly when it is needed.
+echo "[resume] Superlocal ready; no reconnect steps required."

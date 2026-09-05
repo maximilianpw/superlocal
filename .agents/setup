@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+SECONDS=0
+
+# Amp's Debian template supplies Node/npm; Node runs the web TypeScript tests.
+node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 22 || (major === 22 && minor < 18)) throw new Error("Orb setup requires Node >=22.18 from the Amp template")'
+bun_version="$(node -p 'JSON.parse(require("node:fs").readFileSync("package.json", "utf8")).packageManager.replace(/^bun@/, "")')"
+[[ "$bun_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+echo "[setup] Checking Bun $bun_version (${SECONDS}s)"
+if ! command -v bun >/dev/null || [[ "$(bun --no-env-file --version)" != "$bun_version" ]]; then
+  missing=()
+  command -v curl >/dev/null || missing+=(curl ca-certificates)
+  command -v unzip >/dev/null || missing+=(unzip)
+  if (( ${#missing[@]} )); then
+    sudo apt-get update
+    sudo apt-get install -y "${missing[@]}"
+  fi
+  case "$(uname -m)" in
+    x86_64) arch=x64 ;;
+    aarch64) arch=aarch64 ;;
+    *) echo "Unsupported Bun architecture" >&2; exit 1 ;;
+  esac
+  download="$(mktemp -d)"
+  trap 'rm -rf "$download"' EXIT
+  curl --fail --silent --show-error --location --retry 2 --connect-timeout 15 --max-time 120 \
+    "https://github.com/oven-sh/bun/releases/download/bun-v${bun_version}/bun-linux-${arch}.zip" \
+    -o "$download/bun.zip"
+  unzip -q "$download/bun.zip" -d "$download"
+  # This path is already available to Amp and supervised non-interactive shells.
+  sudo install -m 755 "$download/bun-linux-${arch}/bun" /usr/local/bin/bun
+fi
+[[ "$(bun --no-env-file --version)" == "$bun_version" ]]
+
+echo "[setup] Installing locked workspace dependencies (${SECONDS}s)"
+bun --no-env-file install --frozen-lockfile
+echo "[setup] Ready (${SECONDS}s total)"
+# SQLite is embedded in Bun. Do not seed mail, create keys, authenticate, or start
+# services here: setup is snapshotted and shared across fresh project orbs.
