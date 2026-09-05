@@ -1240,7 +1240,10 @@ describe('IMAP host onboarding boundary', () => {
     const headers = { Origin: origin, Cookie: cookie, 'Content-Type': 'application/json' }
     const descriptor = await (await host.fetch(new Request(`${base}/host/config`, { headers }))).json()
     expect(descriptor.providers).toEqual([expect.objectContaining({ id: 'imap', ready: true, mailboxSelection: 'automatic', reconnect: true,
-      fields: [expect.objectContaining({ name: 'email', type: 'email' }), expect.objectContaining({ name: 'password', label: 'App-specific password', type: 'password' })] })])
+      fields: [expect.objectContaining({ name: 'preset', defaultValue: 'icloud', options: [
+        { value: 'icloud', label: 'iCloud Mail' }, { value: 'fastmail', label: 'Fastmail' },
+      ] }), expect.objectContaining({ name: 'email', type: 'email' }), expect.objectContaining({ name: 'password', label: 'App-specific password', type: 'password' }),
+      expect.objectContaining({ name: 'imapUsername', advanced: true }), expect.objectContaining({ name: 'smtpUsername', advanced: true })] })])
     expect(await host.inbox.accounts(host.owner)).toEqual([])
     let captured: any
     const original = host.inbox.createConnection
@@ -1254,8 +1257,29 @@ describe('IMAP host onboarding boundary', () => {
       expect(captured.identity.issuer).toBe('imaps://imap.mail.me.com:993')
       expect(captured.identity.subject).toBe('reader@icloud.com')
       expect(await connected.json()).toEqual({ connectionId: 'synthetic-connection' })
+      const fastmail = await host.fetch(new Request(path, { method: 'POST', headers, body: JSON.stringify({ credentials: {
+        preset: 'fastmail', email: 'Reader@Example.com', password, imapUsername: 'ignored@example.com', smtpUsername: 'ignored@example.com',
+      } }) }))
+      expect(fastmail.status).toBe(200)
+      expect(captured.input.credentials.password).toBe(password)
+      expect(captured.input.providerId).toBe('imap')
+      const fastmailPreset = { id: 'fastmail', name: 'Fastmail', imap: { host: 'imap.fastmail.com', port: 993, secure: true },
+        smtp: { host: 'smtp.fastmail.com', port: 465, secure: true }, sentCopy: 'append' }
+      expect(captured.identity).toEqual({ issuer: 'imaps://imap.fastmail.com:993', subject: 'reader@example.com',
+        registrationId: createHash('sha256').update(JSON.stringify([fastmailPreset, 'reader@example.com', 'reader@example.com'])).digest('hex') })
+      for (const [code, expected] of [['AUTHENTICATION', 'app-specific password'], ['CONNECTION_EXISTS', 'already connected']]) {
+        host.inbox.createConnection = async () => { throw new InboxError(code!, 'Synthetic failure', 409) }
+        const failed = await host.fetch(new Request(path, { method: 'POST', headers, body: JSON.stringify({ credentials: { preset: 'fastmail', email: 'reader@example.com', password } }) }))
+        expect(failed.status).toBe(409)
+        const body = await failed.text()
+        expect(body).toContain(expected!)
+        expect(body).not.toContain(password)
+      }
+      host.inbox.createConnection = async (_owner, input, identity) => { captured = { input, identity }; return { id: 'synthetic-connection' } as Connection }
       captured = null
       for (const credentials of [
+        { preset: 'fastmail', email: 'reader@example.com', password, host: '127.0.0.1' },
+        { preset: 'fastmail', email: 'reader@example.com', password, sentCopy: 'server' },
         { email: 'reader@icloud.com', password, host: '127.0.0.1' },
         { email: 'reader@icloud.com', password, smtp: { host: '169.254.169.254' } },
         { email: 'reader@icloud.com', password, tls: { rejectUnauthorized: false } },
@@ -1269,6 +1293,20 @@ describe('IMAP host onboarding boundary', () => {
         expect((await host.fetch(new Request(`${base}${path}`, { method, headers, body: '{}' }))).status).toBe(403)
       }
     } finally { host.inbox.createConnection = original }
+  })
+
+  test('built-in Fastmail preset cannot be shadowed; custom presets remain available', async () => {
+    const root = await mkdtemp(join(TEMP_ROOT, 'fastmail-config-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const configPath = join(root, 'local.json')
+    loadLocalConfig({ configPath, environment: {} })
+    const input = JSON.parse(await readFile(configPath, 'utf8'))
+    input.providers.imap.servers = [{ id: 'fastmail', name: 'Custom server', imap: { host: 'imap.example.com', port: 993, secure: true }, sentCopy: 'append' }]
+    await writeFile(configPath, JSON.stringify(input))
+    expect(() => loadLocalConfig({ configPath, environment: {} })).toThrow('IMAP preset id')
+    input.providers.imap.servers[0].id = 'custom-mail'
+    await writeFile(configPath, JSON.stringify(input))
+    expect(loadLocalConfig({ configPath, environment: {} }).providers.imap.servers[0]?.id).toBe('custom-mail')
   })
 })
 

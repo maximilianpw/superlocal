@@ -177,7 +177,7 @@ export function loadLocalConfig(options: { configPath?: string; environment?: No
   if (!Array.isArray(imap.servers ?? []) || ((imap.servers ?? []) as unknown[]).length > 16) invalid('providers.imap.servers')
   const imapServers: ImapHostPreset[] = ((imap.servers ?? []) as unknown[]).map(value => {
     const server = record(value, 'IMAP server preset', ['id', 'name', 'imap', 'smtp', 'sentCopy'])
-    if (typeof server.id !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(server.id) || server.id === 'icloud') invalid('IMAP preset id')
+    if (typeof server.id !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(server.id) || ['icloud', 'fastmail'].includes(server.id)) invalid('IMAP preset id')
     if (typeof server.name !== 'string' || !server.name.trim() || server.name.length > 80 || /[\x00-\x1f\x7f]/.test(server.name)) invalid('IMAP preset name')
     const endpoint = (value: unknown) => {
       const input = record(value, 'mail endpoint', ['host', 'port', 'secure'])

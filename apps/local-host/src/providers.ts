@@ -108,19 +108,22 @@ export function createRealRegistrations(config: LocalConfig, runtime: ReturnType
   if (config.providers.imap.enabled) {
     const presets: ImapHostPreset[] = [{ id: 'icloud', name: 'iCloud Mail',
       imap: { host: 'imap.mail.me.com', port: 993, secure: true },
-      smtp: { host: 'smtp.mail.me.com', port: 587, secure: false }, sentCopy: 'append' }, ...config.providers.imap.servers]
+      smtp: { host: 'smtp.mail.me.com', port: 587, secure: false }, sentCopy: 'append' },
+      { id: 'fastmail', name: 'Fastmail', imap: { host: 'imap.fastmail.com', port: 993, secure: true },
+        smtp: { host: 'smtp.fastmail.com', port: 465, secure: true }, sentCopy: 'append' }, ...config.providers.imap.servers]
     const prepare = (credentials: Record<string, unknown>) => {
       const preset = presets.find(preset => preset.id === (credentials.preset || 'icloud'))
       if (!preset) throw new InboxError('HOST_IMAP_ENDPOINT_FORBIDDEN', 'Select a mail server preset configured by this host.', 400)
       const { email, password } = credentials
       if (typeof email !== 'string' || !/^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/.test(email) || typeof password !== 'string' || !password.length) {
-        throw new InboxError('HOST_INVALID_CREDENTIALS', 'Enter the mailbox email and its mail password. For iCloud, use an app-specific password.', 400)
+        throw new InboxError('HOST_INVALID_CREDENTIALS', 'Enter the mailbox login email and its mail password. For iCloud and Fastmail, use an app-specific password.', 400)
       }
       // Endpoints, TLS, and Sent policy are host-owned. Browser fields cannot override them.
       // The full iCloud address is Apple's documented alternative IMAP username and required SMTP username.
       const address = email.toLowerCase()
-      const imapUser = preset.id === 'icloud' ? address : typeof credentials.imapUsername === 'string' && credentials.imapUsername || address
-      const smtpUser = preset.id === 'icloud' ? address : typeof credentials.smtpUsername === 'string' && credentials.smtpUsername || address
+      const builtInLogin = preset.id === 'icloud' || preset.id === 'fastmail'
+      const imapUser = builtInLogin ? address : typeof credentials.imapUsername === 'string' && credentials.imapUsername || address
+      const smtpUser = builtInLogin ? address : typeof credentials.smtpUsername === 'string' && credentials.smtpUsername || address
       const identity = { issuer: `imaps://${preset.imap.host}:${preset.imap.port}`, subject: imapUser,
         registrationId: createHash('sha256').update(JSON.stringify([preset, address, smtpUser])).digest('hex') }
       return { identity, email: address, imap: { ...preset.imap, user: imapUser, password },
@@ -130,7 +133,7 @@ export function createRealRegistrations(config: LocalConfig, runtime: ReturnType
       if (error instanceof InboxError && error.code.startsWith('HOST_')) throw error
       const code = error instanceof InboxError ? error.code : 'NETWORK'
       if (code === 'CONNECTION_EXISTS') throw new InboxError('HOST_IMAP_ALREADY_CONNECTED', 'This mailbox is already connected. Choose its Reconnect option to replace the password.', 409)
-      const message = code === 'AUTHENTICATION' || code === 'CREDENTIALS_UNAVAILABLE' ? 'Mail sign-in failed. Check the mailbox email and use a valid app-specific password for iCloud. Revoked passwords must be replaced.'
+      const message = code === 'AUTHENTICATION' || code === 'CREDENTIALS_UNAVAILABLE' ? 'Mail sign-in failed. Check the mailbox login email and use a valid app-specific password for iCloud or Fastmail. Fastmail requires a plan with IMAP access. Revoked passwords must be replaced.'
         : code === 'ACCOUNT_MISMATCH' ? 'Reconnect using the same mailbox, server preset and usernames. A different account needs a new connection.'
         : 'The mail server could not be reached securely. Check the configured servers and connection, then try again; certificate verification cannot be disabled.'
       throw new InboxError(`HOST_IMAP_${code === 'AUTHENTICATION' || code === 'CREDENTIALS_UNAVAILABLE' ? 'AUTHENTICATION' : code === 'ACCOUNT_MISMATCH' ? 'ACCOUNT_MISMATCH' : 'CONNECTION_FAILED'}`, message, 409)
@@ -141,15 +144,16 @@ export function createRealRegistrations(config: LocalConfig, runtime: ReturnType
         return new ImapProvider({ accountId: credentials.accountId, userId: credentials.userId, signal: context?.signal,
           email: prepared.email, imap: prepared.imap, smtp: prepared.smtp, sentCopy: prepared.sentCopy })
       } },
-      onboarding: { id: 'imap', name: presets.length === 1 ? 'iCloud Mail' : 'iCloud Mail / IMAP', connection: 'credentials', enabled: true, ready: true,
+      onboarding: { id: 'imap', name: 'iCloud Mail / Fastmail / IMAP', connection: 'credentials', enabled: true, ready: true,
         actionLabel: 'Connect mailbox', mailboxSelection: 'automatic', reconnect: true,
         credentialHelp: { text: 'For iCloud, create a dedicated app-specific password with two-factor authentication enabled. Do not use your Apple Account password.', url: 'https://support.apple.com/en-us/102654' },
         fields: [
-          ...(presets.length > 1 ? [{ name: 'preset', label: 'Mail service', type: 'select' as const, required: true, defaultValue: 'icloud', options: presets.map(preset => ({ value: preset.id, label: preset.name })) }] : []),
+          // Omitted presets still mean iCloud for existing clients and stored credentials.
+          { name: 'preset', label: 'Mail service', type: 'select', required: false, defaultValue: 'icloud', options: presets.map(preset => ({ value: preset.id, label: preset.name })) },
           { name: 'email', label: 'Email address', type: 'email', required: true },
           { name: 'password', label: 'App-specific password', type: 'password', required: true },
-          ...(presets.length > 1 ? [{ name: 'imapUsername', label: 'IMAP username (defaults to email)', type: 'text' as const, required: false, advanced: true },
-            { name: 'smtpUsername', label: 'SMTP username (defaults to email)', type: 'text' as const, required: false, advanced: true }] : []),
+          { name: 'imapUsername', label: 'IMAP username (defaults to email)', type: 'text', required: false, advanced: true },
+          { name: 'smtpUsername', label: 'SMTP username (defaults to email)', type: 'text', required: false, advanced: true },
         ] },
       async connect(inbox, owner, credentials) {
         try {

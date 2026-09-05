@@ -270,8 +270,9 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
     const hasPreset = provider.fields?.some(field => field.type === "select") ?? false;
     const currentPreset = preset || provider.fields?.find(field => field.type === "select")?.defaultValue || "icloud";
     const isIcloud = !hasPreset || currentPreset === "icloud";
+    const isFastmail = provider.id === "imap" && currentPreset === "fastmail";
     const fieldInput = (field: Field) => <label className="settings-field" key={field.name}>
-      <span>{field.type === "password" && provider.id === "imap" && !isIcloud ? "Mail password" : field.label}</span>
+      <span>{isFastmail && field.name === "email" ? "Fastmail login email" : field.type === "password" && provider.id === "imap" && !isIcloud && !isFastmail ? "Mail password" : field.label}</span>
       {field.type === "select" ? <select name={field.name} required={field.required} value={currentPreset} onChange={event => setPreset(event.target.value)}>
         {field.options?.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
       </select> : <input name={field.name} type={field.type} required={field.required} maxLength={4096}
@@ -286,12 +287,16 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
         </> : <>
           {reconnecting && <p className="settings-note">Enter a new password for {reconnecting.email || reconnecting.name}. Server settings stay the same.</p>}
           {(provider.fields ?? []).filter(field => !field.advanced).map(fieldInput)}
-          {!isIcloud && provider.fields?.some(field => field.advanced) && <details className="provider-advanced">
+          {!isIcloud && !isFastmail && provider.fields?.some(field => field.advanced) && <details className="provider-advanced">
             <summary>Advanced server settings</summary>
             <p className="settings-note">Server endpoints and required TLS are set by the selected host preset. Change presets in the local host configuration.</p>
             {provider.fields.filter(field => field.advanced).map(fieldInput)}
           </details>}
           {provider.credentialHelp && isIcloud && <p className="settings-note">{provider.credentialHelp.text} <a href={provider.credentialHelp.url} target="_blank" rel="noopener noreferrer">Create an app-specific password</a></p>}
+          {isFastmail && <>
+            <p className="settings-note">Use your Fastmail login, not a domain alias, and a dedicated app password with Mail access. Your plan must support IMAP. Do not use your regular Fastmail password. <a href="https://www.fastmail.help/hc/en-us/articles/360058752854" target="_blank" rel="noopener noreferrer">Create an app-specific password</a></p>
+            <p className="settings-note">Connect once for all addresses in this mailbox. Superlocal saves sent mail; turn off Fastmail’s “Save a copy when sending through third-party email clients” option if enabled to avoid duplicate sent messages.</p>
+          </>}
           <button className="settings-button" type="submit">{step.reconnectId ? "Reconnect" : provider.actionLabel || `Connect ${provider.name}`}</button>
         </>}
       </form>

@@ -183,6 +183,7 @@ The goal is **ready-to-connect providers out of the box**: choose a service, com
 | Gmail | Implemented; host OAuth client configuration required | Make authorization, reconnects, and multi-account setup simpler. |
 | [Inbound.new](https://inbound.new) | Implemented; API-key onboarding and domain/address views | Improve large-domain onboarding, import progress, and recovery within the provider's sync limits. |
 | iCloud / IMAP | In progress | Email + app-specific-password setup for iCloud, secure IMAP/SMTP presets, and end-to-end provider qualification. |
+| Fastmail | Built-in IMAP/SMTP preset; live account qualification pending | One connection per login, including incoming mail for custom-domain aliases. |
 | [Resend](https://resend.com/docs/dashboard/receiving/introduction) | Planned | Add a sending/receiving adapter using received-email APIs, attachment retrieval, and verified webhook ingestion. |
 | [Cloudflare Email Service](https://developers.cloudflare.com/email-service/) | Planned | Bridge Email Routing / Email Workers into durable SDK mail storage, and integrate supported sending APIs or SMTP. |
 
@@ -225,6 +226,17 @@ The current Gmail and Inbound connectors use the local host configuration:
 Provider credentials are submitted to the host, encrypted per connection by the SDK, and not returned by the mail APIs. Mock and real modes stay separate. The Gmail OAuth defaults reference `SUPERLOCAL_GOOGLE_CLIENT_ID` and `SUPERLOCAL_GOOGLE_CLIENT_SECRET`; export them explicitly, or configure the corresponding `providers.gmail.oauth` values as private strings or `{ "env": "YOUR_VARIABLE_NAME" }` references. No SDK `.env` file or unrelated ambient credentials are imported.
 
 Real connections default to normal mail access (`allowProviderWrites.real: true`). For an optional read-only host, set it to `false`; Gmail can use `https://www.googleapis.com/auth/gmail.readonly` with `openid` and `email` rather than modify/send scopes. Reauthorize old read-only grants before sending or modifying mail. Provider capabilities and OAuth permissions still determine which native actions are available.
+
+### Fastmail
+
+1. In the retained `superlocal.local.json`, set `mode` to `real` and ensure `providers.imap.enabled` is `true` (the default). Keep existing instance IDs, data and keys.
+2. Restart, then open **Settings → Accounts → iCloud Mail / Fastmail / IMAP** and choose **Fastmail** under **Mail service**.
+3. Enter your full Fastmail login email, not an alias, and a dedicated [app password](https://www.fastmail.help/hc/en-us/articles/360058752854) with Mail access. Your Fastmail plan must include IMAP. Never put passwords in source files or chat.
+4. Connect once per login, even when several custom domains deliver into that mailbox. No DNS changes are needed. Reading mail for aliases is supported through the same mailbox; automatic alias discovery and a sender-identity picker are not part of this preset.
+
+The host fixes IMAP to `imap.fastmail.com:993` and SMTP to `smtp.fastmail.com:465`, both with TLS. Superlocal saves a Sent copy via IMAP; if enabled, turn off Fastmail's **Save a copy when sending through third-party email clients** option under the advanced composing preferences in **Settings → My email addresses** to avoid duplicates. To replace an app password, choose **Reconnect** and select **Fastmail** again, using the same login.
+
+The built-in preset IDs `icloud` and `fastmail` are reserved. If an older installation has a custom preset named `fastmail`, do not silently rename an existing connected account's preset: retain its original configuration/build until that connection's migration has been planned.
 
 <details>
 <summary>Runtime storage and advanced local configuration</summary>
