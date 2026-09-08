@@ -4,10 +4,11 @@ import { Icon } from "./components";
 import type { HostConfiguration, HostProvider } from "./host";
 import { connectHostProvider } from "./host";
 import type { InboxStore } from "./inbox";
+import OutlookAccessProbe from "./OutlookAccessProbe";
 
 type Phase = "connecting" | "finding" | "adding" | "syncing" | "refreshing" | "connected" | "failed";
 type Progress = { kind: "progress"; providerId: string; reconnectId: string | null; phase: Phase; failedAt: Phase | null; connectionIds: string[]; added: string[]; error: string | null; note: string | null };
-type Step = { kind: "pick" } | { kind: "connect"; providerId: string; reconnectId: string | null } | Progress;
+type Step = { kind: "pick" } | { kind: "outlook" } | { kind: "connect"; providerId: string; reconnectId: string | null } | Progress;
 type Field = NonNullable<HostProvider["fields"]>[number];
 
 // Compare selector values, not object property order. Do not infer receiving scopes from names or senders.
@@ -47,6 +48,7 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
   const configuration = snapshot.host ?? host;
   const [step, setStep] = useState<Step>({ kind: "pick" });
   const [preset, setPreset] = useState("");
+  const [outlookBusy, setOutlookBusy] = useState(false);
   const controller = useRef<AbortController | null>(null);
   const mounted = useRef(false);
   const resumed = useRef<"idle" | "running" | "handled">("idle");
@@ -63,8 +65,8 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
   }, []);
 
   const providers = useMemo(() => (configuration?.providers ?? []).filter(provider => provider.enabled), [configuration]);
-  const provider = step.kind === "pick" ? null : providers.find(item => item.id === step.providerId) ?? null;
-  const busy = step.kind === "progress" && step.phase !== "connected" && step.phase !== "failed";
+  const provider = step.kind === "pick" || step.kind === "outlook" ? null : providers.find(item => item.id === step.providerId) ?? null;
+  const busy = step.kind === "outlook" ? outlookBusy : step.kind === "progress" && step.phase !== "connected" && step.phase !== "failed";
 
   useEffect(() => {
     const toPick = () => {
@@ -74,6 +76,7 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
       setStep({ kind: "pick" });
     };
     onStepChange(step.kind === "pick" ? { title: "Add account", back: null, busy: false }
+      : step.kind === "outlook" ? { title: "Outlook access test", back: busy ? null : toPick, busy }
       : step.kind === "connect" ? { title: step.reconnectId ? `Reconnect ${provider?.name ?? "account"}` : `Add ${provider?.name ?? "account"}`, back: toPick, busy: false }
       : { title: provider?.name ?? "Connecting", back: step.phase === "failed" ? toPick : null, busy });
   }, [step, provider, busy, onStepChange]);
@@ -215,6 +218,10 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
 
   if (!configuration) return <p className="settings-note" role="status">Loading provider setup…</p>;
 
+  if (step.kind === "outlook") return configuration.outlookProbe?.enabled && configuration.outlookProbe.redirectUri
+    ? <OutlookAccessProbe redirectUri={configuration.outlookProbe.redirectUri} onBusyChange={setOutlookBusy} />
+    : <p className="settings-note" role="alert">Open the configured localhost address to test Outlook access.</p>;
+
   if (step.kind === "pick") {
     const addable = providers.filter(item => item.connection !== "none");
     const covered = new Set(snapshot.mailboxes.filter(box => box.status !== "detached").map(box => box.connectionId));
@@ -235,6 +242,14 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
           })}
         </div>}
         {addable.length === 0 && configuration.mode !== "mock" && <p className="settings-note">No providers are enabled in the local host configuration.</p>}
+        {configuration.outlookProbe && <div className="provider-options">
+          <button type="button" className="provider-option" disabled={!configuration.outlookProbe.enabled}
+            title={!configuration.outlookProbe.enabled ? "Open the configured http://localhost address to test Outlook." : undefined}
+            onClick={() => { setOutlookBusy(false); setStep({ kind: "outlook" }); }}>
+            <span className="mailbox-row-label"><span>Outlook · Access test</span><small>Check work-account consent and mailbox access</small></span>
+            <Icon name="ChevronRight" size={14} />
+          </button>
+        </div>}
         {sources.length > 0 && <section className="provider-connected" aria-label="Connected accounts">
           <h3>Connected</h3>
           <ul>

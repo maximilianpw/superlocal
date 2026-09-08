@@ -312,6 +312,11 @@
 .provider-result strong { color: var(--text); font-weight: 500; }
 .provider-added { margin: -8px 0 0; padding-inline-start: 28px; color: var(--muted); }
 .provider-connection-error { margin: 0; color: var(--danger); line-height: 20px; }
+.outlook-probe form { display: grid; gap: 16px; }
+.outlook-probe .provider-phases li { justify-content: space-between; flex-wrap: wrap; }
+.outlook-probe .provider-phases small { font-size: inherit; }
+.outlook-redirect { display: block; margin-block: 12px; overflow-wrap: anywhere; }
+.outlook-sign-in { justify-self: start; display: inline-flex; align-items: center; text-decoration: none; }
 
 .settings-field {
   display: grid;
