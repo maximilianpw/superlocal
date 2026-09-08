@@ -5,6 +5,7 @@
   "packageManager": "bun@1.4.0",
   "engines": { "bun": ">=1.4.0" },
   "workspaces": ["packages/*", "apps/*"],
+  "devDependencies": { "@types/node": "26.5.0" },
   "scripts": {
     "classify": "bun --no-env-file apps/local-host/src/classification/cli.ts",
     "start": "bun --no-env-file run --cwd apps/web build && bun --no-env-file scripts/dev.ts --built",

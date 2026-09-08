@@ -10,6 +10,44 @@ import {
 } from "../src/storage.ts";
 import { AUTH_REQUIRED_EVENT, beginGoogleLogin, checkAuthenticationResponse, createScopedFetch, readApplicationAccess, signOutApplication } from "../src/application-auth.ts";
 import { bindApplicationScope, createApplicationScope } from "../src/application-scope.ts";
+import { createOutlookProbeClient } from "../src/outlook-probe-client.ts";
+
+test("Outlook test transport binds its owner, recovers by attempt ID and rejects unsafe results", async () => {
+  const original = globalThis.fetch;
+  const binding = createApplicationScope("c".repeat(64));
+  const requests: Array<{ path: string; method: string }> = [];
+  const id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  let payload: unknown = { id, mode: "read", phase: "awaiting-sign-in", checks: [{ stage: "sign-in", status: "running" }], accessToken: "must-not-reach-ui" };
+  globalThis.fetch = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+    assert.equal(new Headers(init?.headers).get("X-Superlocal-Scope"), "c".repeat(64));
+    assert.equal(init?.credentials, "include");
+    assert.equal(init?.cache, "no-store");
+    assert.ok(init?.signal instanceof AbortSignal);
+    requests.push({ path: String(input), method: init?.method ?? "GET" });
+    return Response.json(payload);
+  }, { preconnect: original.preconnect });
+  try {
+    const client = createOutlookProbeClient(createScopedFetch(binding));
+    const signal = new AbortController().signal;
+    const started = await client.start({ id, clientId: id, tenantId: id, mode: "read" }, signal);
+    assert.equal(JSON.stringify(started).includes("must-not-reach-ui"), false);
+    await client.status(id, signal);
+    await client.cancel(id, signal);
+    assert.deepEqual(requests, [
+      { path: "/host/outlook-probe", method: "POST" },
+      { path: `/host/outlook-probe/${id}`, method: "GET" },
+      { path: `/host/outlook-probe/${id}`, method: "DELETE" },
+    ]);
+    for (const invalid of [null, {}, { ...started, id: "wrong-owner-result" }, { ...started, checks: [{ stage: "sign-in", status: "connected" }] }, { ...started, checks: [...started.checks, ...started.checks] }]) {
+      payload = invalid;
+      await assert.rejects(client.status(id, signal));
+    }
+    const beforeLock = requests.length;
+    binding.lock();
+    await assert.rejects(client.status(id, signal));
+    assert.equal(requests.length, beforeLock);
+  } finally { globalThis.fetch = original; }
+});
 
 const scopeA = "a".repeat(64), scopeB = "b".repeat(64);
 

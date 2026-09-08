@@ -28,6 +28,7 @@ export type HostConfiguration = {
   preferenceScope?: string;
   performanceLogging?: boolean;
   aiTriage?: boolean;
+  outlookProbe?: { enabled: boolean; redirectUri?: string };
   providers: HostProvider[];
 };
 

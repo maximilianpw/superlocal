@@ -17,6 +17,8 @@ import { createGoogleOAuthHost, type GoogleOAuthConfig, type OAuthAttempt } from
 import { createGoogleOAuthApi } from '../server/google-oauth-api'
 import { createGoogleOAuthClient } from '../server/google-client'
 import { ImapProvider, type ImapCredentials } from '../server/sdk/imap'
+import { createOutlookProbe } from '../../../apps/local-host/src/outlook-probe'
+import { diagnose, mailScopes, ProbeFailure, readMailbox, runProbe, type Authentication, type Session } from '../../../apps/local-host/src/outlook-probe-checks'
 import { createLocalHost } from '../../../apps/local-host/src/host'
 import { loadLocalConfig, type LocalConfig } from '../../../apps/local-host/src/config'
 import { createAttentionFeedbackStore } from '../../../apps/local-host/src/attention-feedback'
@@ -9192,3 +9194,267 @@ describe('AI triage service', () => {
     expect(calls).toBe(33)
   })
 })
+
+
+describe('Outlook access probe host', () => {
+  test('authenticates host routes, binds PKCE callbacks, refreshes through real MSAL and keeps tokens private', async () => {
+    const root = await mkdtemp(join(TEMP_ROOT, 'outlook-host-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const initial = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
+    const config: LocalConfig = { ...initial, mode: 'real', dataDir: join(root, 'data'), providers: { ...initial.providers, imap: { enabled: false, servers: [] } } }
+    const host = await createLocalHost(config, {})
+    cleanup.push(() => host.close())
+    const origin = config.web.origin
+    const call = (path: string, method = 'GET', cookie = '', body?: unknown, requestOrigin: string | null = origin) => host.fetch(new Request(`http://localhost:${config.backend.port}${path}`, {
+      method, headers: { ...(requestOrigin ? { Origin: requestOrigin } : {}), Cookie: cookie, 'X-Superlocal': '1', 'Content-Type': 'application/json' },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    }))
+    const cookie = (await call('/session', 'POST')).headers.get('set-cookie')?.split(';')[0]
+    if (!cookie) throw new Error('Missing fixture session')
+    const input = { id: randomUUID(), clientId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', tenantId: '11111111-2222-3333-4444-555555555555', mode: 'read' }
+    expect((await call('/host/outlook-probe', 'POST', '', input)).status).toBe(401)
+    expect((await call('/host/outlook-probe', 'POST', cookie, input, 'https://evil.test')).status).toBe(403)
+    expect((await call('/host/outlook-probe', 'POST', cookie, input, null)).status).toBe(403)
+    expect((await call('/host/outlook-probe', 'POST', cookie, { ...input, clientSecret: 'must-not-accept' })).status).toBe(400)
+    const grants: string[] = [], graphTokens: string[] = []
+    let challenge = ''
+    let failRefresh = false
+    const base = `https://login.microsoftonline.com/${input.tenantId}/v2.0`
+    const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url')
+    const jwt = `${encode({ alg: 'RS256', typ: 'JWT' })}.${encode({ aud: input.clientId, iss: base, tid: input.tenantId, oid: 'fictional-user', sub: 'fictional-user', preferred_username: 'fictional@example.test', iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 3600 })}.fixture-signature`
+    const realFetch = globalThis.fetch
+    const stub = spyOn(globalThis, 'fetch').mockImplementation(Object.assign(async (target: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(target))
+      expect(init?.redirect).toBe('error')
+      expect(init?.signal).toBeInstanceOf(AbortSignal)
+      if (url.origin === 'https://graph.microsoft.com') {
+        expect(init?.method).toBe('GET')
+        expect(url.pathname + url.search).toBe('/v1.0/me/messages?$top=1&$select=id')
+        graphTokens.push(new Headers(init?.headers).get('Authorization') ?? '')
+        return Response.json({ value: [{ id: 'private-message-id' }] })
+      }
+      expect(url.origin).toBe('https://login.microsoftonline.com')
+      if (url.pathname.includes('/discovery/instance')) return Response.json({ tenant_discovery_endpoint: `${base}/.well-known/openid-configuration`, metadata: [{ preferred_network: 'login.microsoftonline.com', preferred_cache: 'login.microsoftonline.com', aliases: ['login.microsoftonline.com'] }] })
+      if (url.pathname.includes('.well-known')) return Response.json({ authorization_endpoint: `https://login.microsoftonline.com/${input.tenantId}/oauth2/v2.0/authorize`, token_endpoint: `https://login.microsoftonline.com/${input.tenantId}/oauth2/v2.0/token`, end_session_endpoint: `https://login.microsoftonline.com/${input.tenantId}/oauth2/v2.0/logout`, issuer: base, jwks_uri: 'https://login.microsoftonline.com/common/discovery/v2.0/keys' })
+      if (!url.pathname.endsWith('/token')) throw new Error('Unexpected Microsoft request')
+      const form = new URLSearchParams(String(init?.body)), grant = form.get('grant_type') ?? ''
+      grants.push(grant)
+      expect(form.has('client_secret')).toBe(false)
+      if (grant === 'authorization_code') {
+        expect(createHash('sha256').update(form.get('code_verifier') ?? '').digest('base64url')).toBe(challenge)
+        expect(form.get('redirect_uri')).toBe(`${origin}/host/outlook-probe/callback`)
+      } else {
+        expect(grant).toBe('refresh_token')
+        expect(form.get('refresh_token')).toBe('fixture-refresh-token')
+        if (failRefresh) return Response.json({ error: 'invalid_grant', error_description: 'AADSTS53003 confidential policy detail' }, { status: 400 })
+      }
+      return Response.json({ token_type: 'Bearer', scope: 'Mail.Read', expires_in: 3600, access_token: grant === 'authorization_code' ? 'fixture-first-token' : 'fixture-refreshed-token', refresh_token: 'fixture-refresh-token', id_token: jwt, client_info: encode({ uid: 'fictional-user', utid: input.tenantId }) })
+    }, { preconnect: realFetch.preconnect }))
+    cleanup.push(async () => { stub.mockRestore() })
+    const waitFor = async (id: string, phase: string) => {
+      for (let i = 0; i < 100; i++) {
+        const state = await (await call(`/host/outlook-probe/${id}`, 'GET', cookie)).json()
+        if (state.phase === phase) return state
+        await Bun.sleep(5)
+      }
+      throw new Error(`Outlook test did not reach ${phase}`)
+    }
+    const begin = async () => {
+      expect((await call('/host/outlook-probe', 'POST', cookie, input)).status).toBe(200)
+      await waitFor(input.id, 'awaiting-sign-in')
+      expect((await call(`/host/outlook-probe/authorize/${input.id}`, 'GET', '')).status).toBe(401)
+      const response = await call(`/host/outlook-probe/authorize/${input.id}`, 'GET', cookie, undefined, null)
+      const location = response.headers.get('Location')
+      if (!location) throw new Error('No sign-in redirect')
+      const authorization = new URL(location)
+      challenge = authorization.searchParams.get('code_challenge') ?? ''
+      expect(authorization.searchParams.get('code_challenge_method')).toBe('S256')
+      expect(authorization.searchParams.get('scope')).toContain('offline_access')
+      expect(authorization.searchParams.get('prompt')).toBe('select_account')
+      expect((await call(`/host/outlook-probe/authorize/${input.id}`, 'GET', cookie)).status).toBe(303)
+      return `/host/outlook-probe/callback?state=${authorization.searchParams.get('state')}`
+    }
+    const callback = await begin()
+    expect((await call('/host/outlook-probe', 'POST', cookie, input)).status).toBe(200)
+    expect((await call('/host/outlook-probe', 'POST', cookie, { ...input, id: randomUUID() })).status).toBe(409)
+    expect((await call(`${callback}&state=forged&code=fixture`, 'GET', cookie, undefined, null)).status).toBe(400)
+    expect((await call('/host/outlook-probe/callback?state=forged&code=fixture', 'GET', cookie, undefined, null)).status).toBe(400)
+    expect((await call(`${callback}&code=fixture`, 'GET', cookie, undefined, null)).status).toBe(200)
+    expect((await call(`${callback}&code=fixture`, 'GET', cookie, undefined, null)).status).toBe(400)
+    const report = await waitFor(input.id, 'finished')
+    expect(report.report.outcome).toBe('passed')
+    expect(grants).toEqual(['authorization_code', 'refresh_token'])
+    expect(graphTokens).toEqual(['Bearer fixture-first-token', 'Bearer fixture-refreshed-token'])
+    expect(JSON.stringify(report)).not.toContain('fixture-')
+    expect(JSON.stringify(report)).not.toContain('private-message-id')
+    expect(await host.inbox.connections(host.owner)).toHaveLength(0)
+    failRefresh = true; input.id = randomUUID()
+    const refreshCallback = await begin()
+    await call(`${refreshCallback}&code=fixture`, 'GET', cookie, undefined, null)
+    const denied = await waitFor(input.id, 'finished')
+    expect(denied.checks.map((check: { status: string }) => check.status)).toEqual(['passed', 'passed', 'failed'])
+    expect(denied.checks.at(-1).code).toBe('AADSTS53003')
+    expect(JSON.stringify(denied)).not.toContain('confidential')
+    input.id = randomUUID()
+    const consentCallback = await begin()
+    await call(`${consentCallback}&error=access_denied&error_description=AADSTS90094%20private`, 'GET', cookie, undefined, null)
+    expect((await waitFor(input.id, 'finished')).checks[0].code).toBe('AADSTS90094')
+    input.id = randomUUID()
+    const cancelledCallback = await begin()
+    expect((await call(`/host/outlook-probe/${input.id}`, 'DELETE', cookie)).status).toBe(200)
+    expect((await waitFor(input.id, 'cancelled')).phase).toBe('cancelled')
+    expect((await call(`${cancelledCallback}&code=fixture`, 'GET', cookie, undefined, null)).status).toBe(400)
+  })
+
+  test('isolates owners, expires attempts, propagates cancellation and clears authentication', async () => {
+    let clears = 0, authorizations = 0
+    const service = createOutlookProbe('http://localhost:5178', { timeoutMs: 30, createAuthentication: options => ({
+      async signIn() { authorizations++; await options.authorize(async request => `https://login.microsoftonline.com/test?state=${request.state}`); throw new Error('No callback should complete') },
+      async refresh() { throw new Error('Must not refresh') }, clear: async () => { clears++ },
+    }) })
+    try {
+      const input = { id: randomUUID(), clientId: randomUUID(), tenantId: randomUUID(), mode: 'read' }
+      service.start('owner-a', input)
+      expect(() => service.status('owner-b', input.id)).toThrow()
+      expect(() => service.cancel('owner-b', input.id)).toThrow()
+      expect(() => service.authorize('owner-b', input.id)).toThrow()
+      await Bun.sleep(50)
+      const expired = service.status('owner-a', input.id)
+      expect(expired.phase).toBe('finished')
+      expect(expired.checks[0]?.code).toBe('SIGN_IN_TIMEOUT')
+      expect(clears).toBe(1)
+      service.start('owner-a', { ...input, id: randomUUID() })
+      await service.close()
+      expect(clears).toBe(2)
+      expect(authorizations).toBe(2)
+    } finally { await service.close() }
+  })
+})
+
+describe('Outlook access probe verdicts', () => {
+const token = (accessToken: string, scopes = ['Mail.Read']): Session => ({ accessToken, grantedScopes: scopes, fromCache: false });
+
+function outlookFixture(overrides: Partial<Authentication> = {}) {
+  let cleared = false;
+  const auth: Authentication = {
+    signIn: async () => token('first-token'),
+    refresh: async () => token('refreshed-token'),
+    clear: async () => { cleared = true; },
+    ...overrides,
+  };
+  return { auth, wasCleared: () => cleared };
+}
+
+describe('feasibility verdicts', () => {
+  test('requires a successful mailbox read with both original and refreshed tokens', async () => {
+    const f = outlookFixture();
+    const usedTokens: string[] = [];
+    const report = await runProbe({ mode: 'read', auth: f.auth, read: async value => { usedTokens.push(value); } });
+    expect(usedTokens).toEqual(['first-token', 'refreshed-token']);
+    expect(report.outcome).toBe('passed');
+    expect(report.checks.map(check => check.stage)).toEqual(['sign-in', 'mailbox-read', 'token-refresh', 'refreshed-mailbox-read']);
+    expect(JSON.stringify(report)).not.toContain('first-token');
+    expect(JSON.stringify(report)).not.toContain('refreshed-token');
+    expect(f.wasCleared()).toBe(true);
+  });
+
+  test('consent rejection does not read or refresh', async () => {
+    const f = outlookFixture({ signIn: async () => { throw new Error('AADSTS90094: secret account data'); }, refresh: async () => { throw new Error('must not refresh'); } });
+    const report = await runProbe({ mode: 'read', auth: f.auth, read: async () => { throw new Error('must not read'); } });
+    expect(report.checks).toHaveLength(1);
+    expect(report.checks[0]?.code).toBe('AADSTS90094');
+    expect(JSON.stringify(report)).not.toContain('secret account data');
+    expect(report.outcome).toBe('failed');
+    expect(f.wasCleared()).toBe(true);
+  });
+
+  test('denied mailbox access fails even after successful sign-in', async () => {
+    let refreshed = false;
+    const f = outlookFixture({ refresh: async () => { refreshed = true; return token('unused'); } });
+    const report = await runProbe({ mode: 'read', auth: f.auth, read: async () => { throw new ProbeFailure('GRAPH_HTTP_403', 'Access denied'); } });
+    expect(report.checks[0]?.status).toBe('passed');
+    expect(report.checks[1]?.stage).toBe('mailbox-read');
+    expect(report.outcome).toBe('failed');
+    expect(refreshed).toBe(false);
+  });
+
+  test('full mode requires both write and send grants before reading', async () => {
+    const f = outlookFixture({ signIn: async () => token('token', ['Mail.ReadWrite']) });
+    const report = await runProbe({ mode: 'full', auth: f.auth, read: async () => { throw new Error('must not read'); } });
+    expect(report.checks[0]?.code).toBe('MISSING_MAIL_SCOPE');
+    expect(mailScopes('full')).toEqual(['https://graph.microsoft.com/Mail.ReadWrite', 'https://graph.microsoft.com/Mail.Send']);
+  });
+
+  test('cached token is not counted as successful refresh', async () => {
+    const f = outlookFixture({ refresh: async () => ({ ...token('old-token'), fromCache: true }) });
+    let reads = 0;
+    const report = await runProbe({ mode: 'read', auth: f.auth, read: async () => { reads++; } });
+    expect(report.checks.at(-1)?.code).toBe('REFRESH_NOT_VERIFIED');
+    expect(reads).toBe(1);
+    expect(f.wasCleared()).toBe(true);
+  });
+
+  test('refresh failure preserves the successful first read', async () => {
+    const f = outlookFixture({ refresh: async () => { throw new Error('AADSTS53003: confidential details'); } });
+    const report = await runProbe({ mode: 'read', auth: f.auth, read: async () => {} });
+    expect(report.checks.map(check => check.status)).toEqual(['passed', 'passed', 'failed']);
+    expect(report.checks.at(-1)?.stage).toBe('token-refresh');
+    expect(report.checks.at(-1)?.code).toBe('AADSTS53003');
+    expect(f.wasCleared()).toBe(true);
+  });
+
+  test('a rejected refreshed token prevents an overall pass', async () => {
+    const f = outlookFixture();
+    const report = await runProbe({ mode: 'read', auth: f.auth, read: async value => {
+      if (value === 'refreshed-token') throw new ProbeFailure('GRAPH_HTTP_401', 'Token rejected');
+    } });
+    expect(report.outcome).toBe('failed');
+    expect(report.checks.at(-1)?.stage).toBe('refreshed-mailbox-read');
+    expect(f.wasCleared()).toBe(true);
+  });
+});
+
+describe('bounded read-only Graph request', () => {
+  test('requests only one ID, including for empty mailboxes', async () => {
+    for (const value of [[], [{ id: 'private-message-id' }]]) {
+      const fetcher: typeof fetch = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        expect(url.origin).toBe('https://graph.microsoft.com');
+        expect(url.pathname).toBe('/v1.0/me/messages');
+        expect(url.searchParams.get('$top')).toBe('1');
+        expect(url.searchParams.get('$select')).toBe('id');
+        expect(init?.method).toBe('GET');
+        expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer test-token');
+        expect(init?.redirect).toBe('error');
+        expect(init?.signal).toBeInstanceOf(AbortSignal);
+        return Response.json({ value });
+      }, { preconnect: fetch.preconnect });
+      await readMailbox('test-token', fetcher);
+    }
+  });
+
+  test('rejects malformed successful responses', async () => {
+    for (const payload of [{}, { value: [{ subject: 'secret' }] }, { value: [{ id: '1' }, { id: '2' }] }]) {
+      const fetcher: typeof fetch = Object.assign(async () => Response.json(payload), { preconnect: fetch.preconnect });
+      await expect(readMailbox('test-token', fetcher)).rejects.toMatchObject({ code: 'INVALID_GRAPH_RESPONSE' });
+    }
+  });
+
+  test('reports HTTP status without leaking Graph error payloads', async () => {
+    for (const status of [401, 403, 404, 429, 503]) {
+      const fetcher: typeof fetch = Object.assign(async () => Response.json({ secret: 'private data' }, { status }), { preconnect: fetch.preconnect });
+      try { await readMailbox('token', fetcher); throw new Error('Expected failure'); }
+      catch (error) {
+        expect(diagnose(error).code).toBe(`GRAPH_HTTP_${status}`);
+        expect(JSON.stringify(diagnose(error))).not.toContain('private data');
+      }
+    }
+  });
+
+  test('does not emit unrecognized raw errors', () => {
+    expect(JSON.stringify(diagnose(new Error('password=secret email=private@example.com')))).not.toContain('secret');
+  });
+});
+
+
+});

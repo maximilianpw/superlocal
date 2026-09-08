@@ -16,6 +16,7 @@ import { assertApplicationAuthRuntime, createApplicationAuth } from './applicati
 import { loadAiInferenceConfig, type AiInferenceConfig } from './ai-inference'
 import { createAiTriageService } from './ai-triage'
 import type { AiSettings, AiFeedbackInput, AiReadingInput, AiThreadKey } from '../../shared/ai-triage'
+import { createOutlookProbe, outlookProbeCallback, outlookProbeNavigation, outlookProbePath } from './outlook-probe'
 
 const safeHeaders = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', Vary: 'Origin, Cookie' }
 function problem(status: number, code: string, error: string): Response {
@@ -114,6 +115,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
   try { aiTriage = createAiTriageService({ database: runtime.database, inbox: liveInbox, configuration: aiConfiguration, configurationProblem: aiConfigurationProblem, sessionKey: runtime.sessionKey }) }
   catch (error) { try { if (mock) await mock.close(); else await liveInbox.close() } finally { applicationAuth?.close(); runtime.database.close() }; throw error }
   const performanceLog = createPerformanceLog(runtime.dataDir, config.mode)
+  const outlookProbe = createOutlookProbe(config.web.origin)
   const ownerContexts = new Map<string, {
     inboxPreferences: ReturnType<typeof createInboxViewPreferencesStore>
     splitPreferences: ReturnType<typeof createSplitPreferencesStore>
@@ -169,7 +171,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     // Only native element/download URLs have no custom header. Their opaque IDs remain
     // owner-checked by the SDK; never exempt a generic JSON GET or an encoded path alias.
     return ['GET', 'HEAD'].includes(request.method) && (/^\/v1\/messages\/[^/%]+\/media\/[^/%]+$/.test(path) || /^\/v1\/blobs\/[^/%]+$/.test(path)) ||
-      request.method === 'GET' && (/^\/host\/sender-domains\/[^/%]+\/icon$/.test(path) || path === '/v1/oauth/google/callback' || !!mailboxAuthorizationId(request))
+      request.method === 'GET' && (/^\/host\/sender-domains\/[^/%]+\/icon$/.test(path) || path === '/v1/oauth/google/callback' || !!mailboxAuthorizationId(request) || outlookProbeNavigation(path))
   }
   const mailboxAuthorizationId = (request: Request) => request.method === 'GET' ? /^\/v1\/oauth\/google\/authorize\/([^/%]+)$/.exec(new URL(request.url).pathname)?.[1] : undefined
   function ownsMailboxAuthorization(request: Request, owner: string): boolean {
@@ -227,7 +229,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       return problem(404, 'NOT_FOUND', 'Route not found.')
     }
     const extension = extensions.find(extension => extension.matches(url.pathname))
-    const callback = extension?.callbackPath === url.pathname && request.method === 'GET'
+    const callback = (extension?.callbackPath === url.pathname || url.pathname === outlookProbeCallback) && request.method === 'GET'
     const origin = request.headers.get('origin')
     if (!callback && (origin && !origins.has(origin) || request.headers.get('sec-fetch-site') === 'cross-site')) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'This request origin is not permitted.')
     const identity = await currentIdentity(request)
@@ -245,6 +247,19 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     const owner = identity.id
     const { inboxPreferences, splitPreferences, attentionFeedback, senderDomains } = contextFor(owner)
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && (!origin || !origins.has(origin))) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'An exact allowed Origin is required for changes.')
+    if (url.pathname === outlookProbePath || url.pathname.startsWith(`${outlookProbePath}/`)) {
+      const probeOwner = JSON.stringify([owner, identity.scope ?? null])
+      const reply = (value: unknown) => Response.json(value, { headers: safeHeaders })
+      if (url.pathname === outlookProbeCallback && request.method === 'GET') return outlookProbe.callback(probeOwner, url)
+      if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Outlook test input belongs in the JSON body.')
+      if (url.pathname === outlookProbePath && request.method === 'POST') return reply(outlookProbe.start(probeOwner, await jsonBody(request)))
+      const attempt = /^\/host\/outlook-probe\/(authorize\/)?([0-9a-f-]{36})$/.exec(url.pathname)
+      if (attempt?.[2]) {
+        if (request.method === 'GET') return attempt[1] ? outlookProbe.authorize(probeOwner, attempt[2]) : reply(outlookProbe.status(probeOwner, attempt[2]))
+        if (request.method === 'DELETE' && !attempt[1]) return reply(outlookProbe.cancel(probeOwner, attempt[2]))
+      }
+      return problem(404, 'NOT_FOUND', 'Outlook test route not found.')
+    }
     if (url.pathname === '/host/ai-triage' || url.pathname.startsWith('/host/ai-triage/')) {
       const route = url.pathname.slice('/host/ai-triage'.length)
       const reply = (value: unknown) => Response.json(value, { headers: safeHeaders })
@@ -316,7 +331,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       const descriptors: Array<Omit<HostProvider, 'connectionIds'>> = config.mode === 'mock'
         ? [{ id: 'mock', name: 'Offline mock', connection: 'none', enabled: true, ready: true }]
         : registrations.map(registration => registration.onboarding)
-      return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites, performanceLogging: true, aiTriage: aiConfiguration !== null,
+      return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites, performanceLogging: true, aiTriage: aiConfiguration !== null, outlookProbe: outlookProbe.configuration,
         preferenceScope: createHmac('sha256', runtime.sessionKey).update(`split-preferences:${owner}`).digest('hex'),
         providers: descriptors.map(provider => ({ ...provider, connectionIds: connections.filter(connection => connection.providerId === provider.id).map(connection => connection.id) })) }, { headers: safeHeaders })
     }
@@ -377,6 +392,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       sessions.clear()
       streamShutdown.abort()
       return closing = (async () => {
+        await outlookProbe.close()
         await Promise.all([...ownerContexts.values()].map(context => context.senderDomains.close()))
         await Promise.allSettled([...pending])
         ownerContexts.clear()
